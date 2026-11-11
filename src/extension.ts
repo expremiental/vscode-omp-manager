@@ -3,7 +3,9 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { SessionAttention } from "./attention";
 import { SessionPins } from "./pins";
-import { SessionIndex, type SessionInfo, parseSession } from "./sessions";
+import { claudeEnabled, claudeProjectsDir } from "./config";
+import { claudeHookPath, claudeHooksSnippet, installClaudeHook } from "./claudeHook";
+import { type AgentKind, SessionIndex, SessionIndexes, type SessionInfo, parseAnySession } from "./sessions";
 import { systemNotify } from "./systemNotify";
 import { type LaunchOptions, type StateChange, TerminalTracker } from "./tracker";
 import { UsageService } from "./usage";
@@ -34,9 +36,15 @@ function sessionTargetOf(arg: { ownerId?: unknown; terminalKey?: unknown } | und
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-	const index = new SessionIndex();
+	// Claude Code sessions join omp's when enabled; the setting applies on the next window load.
+	const claude = claudeEnabled();
+	const index = new SessionIndexes([
+		new SessionIndex(),
+		...(claude ? [new SessionIndex({ root: claudeProjectsDir(), agent: "claude" })] : []),
+	]);
 	const usage = new UsageService();
-	const tracker = new TerminalTracker(context, context.asAbsolutePath("hook/vscode-session-restore.ts"));
+	const tracker = new TerminalTracker(context, context.asAbsolutePath("hook/vscode-session-restore.ts"), claudeHookPath());
+	if (claude) installClaudeHook(context, tracker.log);
 	const attention = new SessionAttention(context, tracker);
 	const windows = new WindowSessions(context, tracker, attention, index);
 	const pins = new SessionPins();
@@ -54,7 +62,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		}
 	};
 
-	const newSession = async () => {
+	const newSession = async (agent: AgentKind = "omp") => {
 		const config = vscode.workspace.getConfiguration("omp");
 		const mode = config.get<string>("newSessionCwd", "workspaceRoot");
 		const folders = vscode.workspace.workspaceFolders ?? [];
@@ -63,22 +71,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				canSelectFiles: false,
 				canSelectFolders: true,
 				defaultUri: folders[0]?.uri,
-				openLabel: "Start omp here",
+				openLabel: agent === "claude" ? "Start Claude Code here" : "Start omp here",
 			});
-			if (picked?.[0]) await tracker.open({ cwd: picked[0].fsPath });
+			if (picked?.[0]) await tracker.open({ cwd: picked[0].fsPath, agent });
 			return;
 		}
 		const doc = vscode.window.activeTextEditor?.document;
 		if (mode === "activeFileFolder" && doc?.uri.scheme === "file") {
-			await tracker.open({ cwd: path.dirname(doc.uri.fsPath) });
+			await tracker.open({ cwd: path.dirname(doc.uri.fsPath), agent });
 			return;
 		}
 		if (folders.length <= 1) {
-			await tracker.open({ cwd: folders[0]?.uri.fsPath });
+			await tracker.open({ cwd: folders[0]?.uri.fsPath, agent });
 			return;
 		}
-		const picked = await vscode.window.showWorkspaceFolderPick({ placeHolder: "Start omp in which folder?" });
-		if (picked) await tracker.open({ cwd: picked.uri.fsPath });
+		const picked = await vscode.window.showWorkspaceFolderPick({ placeHolder: agent === "claude" ? "Start Claude Code in which folder?" : "Start omp in which folder?" });
+		if (picked) await tracker.open({ cwd: picked.uri.fsPath, agent });
 	};
 
 	const openIn = (location: "editor" | "panel") => (arg: SessionContext | undefined) => {
@@ -105,7 +113,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		const terminalTabShown = vscode.window.tabGroups.activeTabGroup.activeTab?.input instanceof vscode.TabInputTerminal;
 		if (focused && vscode.window.activeTerminal === terminal && terminalTabShown) return;
 
-		const title = index.find(sessionFile)?.title ?? "omp session";
+		const info = index.find(sessionFile);
+		const name = info?.agent === "claude" ? "Claude Code" : "omp";
+		const title = info?.title ?? `${name} session`;
 		const text = state === "waiting" ? `"${title}" needs input` : `"${title}" finished`;
 		const target = sessionTargetOf(windows.sessions().get(windows.identity(sessionFile)));
 		const showInVsCode = () =>
@@ -119,7 +129,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			return;
 		}
 		if (style === "both") showInVsCode();
-		void systemNotify(vscode.env.appName, state === "waiting" ? "omp needs input" : "omp finished", title).then((shown) => {
+		void systemNotify(vscode.env.appName, state === "waiting" ? `${name} needs input` : `${name} finished`, title).then((shown) => {
 			if (!shown && style === "system") showInVsCode();
 		});
 	};
@@ -149,7 +159,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 			const file = sessionFileOf(arg);
-			const session = file && (index.find(file) ?? parseSession(file, fs.statSync(file).mtimeMs));
+			const session = file && (index.find(file) ?? parseAnySession(file, fs.statSync(file).mtimeMs));
 			if (!session) throw new Error("Session metadata is not available yet. Refresh and try again.");
 			pins.pin(session);
 		} catch (error) {
@@ -171,9 +181,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand("omp.session.unpin", setPinned(false)),
 		vscode.commands.registerCommand("omp.focusNextWaiting", focusNextWaiting),
 		vscode.window.registerWebviewViewProvider("omp.main", view),
-		vscode.commands.registerCommand("omp.newSession", newSession),
+		vscode.commands.registerCommand("omp.newSession", () => newSession()),
+		vscode.commands.registerCommand("omp.newClaudeSession", () => newSession("claude")),
+		vscode.commands.registerCommand("omp.copyClaudeHooks", async () => {
+			await vscode.env.clipboard.writeText(claudeHooksSnippet());
+			void vscode.window.showInformationMessage("Hooks JSON copied. Merge it into the \"hooks\" of ~/.claude/settings.json.");
+		}),
 		// The same command with the colored π icon, for the editor tab bar.
-		vscode.commands.registerCommand("omp.newSessionFromEditorTitle", newSession),
+		vscode.commands.registerCommand("omp.newSessionFromEditorTitle", () => newSession()),
 		vscode.commands.registerCommand("omp.refresh", () => {
 			pins.refresh();
 			view.refreshSessions(true);
@@ -234,7 +249,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			};
 			if (!(await canDelete())) return;
 			const title = index.find(file)?.title ?? file;
-			const deletedId = index.find(file)?.id ?? parseSession(file, fs.statSync(file).mtimeMs)?.id;
+			const deletedId = index.find(file)?.id ?? parseAnySession(file, fs.statSync(file).mtimeMs)?.id;
 			const ok = await vscode.window.showWarningMessage(
 				`Delete "${title}"?`,
 				{ modal: true, detail: "The session file and its subagent transcripts move to the trash." },

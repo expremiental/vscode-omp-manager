@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import * as vscode from "vscode";
-import { normPath, ompExecutable, terminalMapDir } from "./config";
+import { claudeExecutable, claudeProjectsDir, isWithin, normPath, ompExecutable, terminalMapDir } from "./config";
+import type { AgentKind } from "./sessions";
 
 /** Env var the omp-side hook reads to tie a session to the terminal that runs it. */
 export const TERMINAL_ENV = "OMP_VSCODE_TERMINAL";
@@ -59,6 +60,8 @@ interface Tracked {
 	pid?: number;
 	/** omp process, as reported by the hook. */
 	agentPid?: number;
+	/** Which CLI this window launched in the terminal; adopted terminals leave it unset. */
+	agent?: AgentKind;
 }
 
 export interface OpenSession {
@@ -87,6 +90,8 @@ export interface LaunchOptions {
 	preserveFocus?: boolean;
 	/** Overrides the `omp.terminalLocation` setting. */
 	location?: "editor" | "panel";
+	/** CLI to start; resuming follows the transcript's location, a new session defaults to omp. */
+	agent?: AgentKind;
 	/** Explicit cross-window target captured by the caller; stale targets never launch. */
 	ownerId?: string;
 	terminalKey?: string;
@@ -135,6 +140,11 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
+/** Claude Code transcripts live under its projects dir; everything else is omp's. */
+export function agentOf(sessionFile: string): AgentKind {
+	return isWithin(sessionFile, claudeProjectsDir()) ? "claude" : "omp";
+}
+
 function envKey(terminal: vscode.Terminal): string | undefined {
 	const opts = terminal.creationOptions;
 	const value = "env" in opts ? opts.env?.[TERMINAL_ENV] : undefined;
@@ -177,10 +187,14 @@ export class TerminalTracker implements vscode.Disposable {
 	private readonly releasedSession = new vscode.EventEmitter<ReleasedSession>();
 	readonly onDidReleaseSession = this.releasedSession.event;
 
-	/** `hookPath`: the bundled omp extension that reports each terminal's session. */
+	/**
+	 * `hookPath`: the bundled omp extension that reports each terminal's session.
+	 * `claudeHookPath`: the stable copy of the Claude Code hook that Claude's settings run.
+	 */
 	constructor(
 		private readonly ctx: vscode.ExtensionContext,
 		private readonly hookPath: string,
+		private readonly claudeHookPath = "",
 	) {}
 
 	async start(): Promise<void> {
@@ -286,13 +300,25 @@ export class TerminalTracker implements vscode.Disposable {
 		const key = crypto.randomUUID();
 		const location = opts.location ?? cfg.get<string>("terminalLocation");
 		const inPanel = location === "panel";
+		const agent = opts.sessionFile ? agentOf(opts.sessionFile) : (opts.agent ?? "omp");
 
-		// Apply extraArgs after the hook, before --resume or --restore
-		const args = ["-e", this.hookPath];
-		const extraArgs = cfg.get<unknown[]>("extraArgs", []);
-		for (const a of extraArgs) if (typeof a === "string") args.push(a);
-		const reopen = continueTurn ? "--restore" : "--resume";
-		if (opts.sessionFile) args.push(reopen, opts.sessionFile);
+		let args: string[];
+		let reopen: string;
+		if (agent === "claude") {
+			// Claude Code reports through its own hooks (see hook/claude-code-status.mjs) and
+			// resumes by session id; the transcript is named after it. It has no --restore.
+			args = [];
+			for (const a of cfg.get<unknown[]>("claude.extraArgs", [])) if (typeof a === "string") args.push(a);
+			reopen = "--resume";
+			if (opts.sessionFile) args.push(reopen, path.basename(opts.sessionFile, ".jsonl"));
+		} else {
+			// Apply extraArgs after the hook, before --resume or --restore
+			args = ["-e", this.hookPath];
+			const extraArgs = cfg.get<unknown[]>("extraArgs", []);
+			for (const a of extraArgs) if (typeof a === "string") args.push(a);
+			reopen = continueTurn ? "--restore" : "--resume";
+			if (opts.sessionFile) args.push(reopen, opts.sessionFile);
+		}
 
 		// Merge custom env, but let OMP_VSCODE_TERMINAL always win
 		const env: Record<string, string> = { [TERMINAL_ENV]: key };
@@ -301,7 +327,7 @@ export class TerminalTracker implements vscode.Disposable {
 			if (typeof v === "string" && k !== TERMINAL_ENV) env[k] = v;
 		}
 
-		const iconId = cfg.get<string>("terminalIcon")?.trim() || "sparkle";
+		const iconId = (agent === "claude" ? cfg.get<string>("claude.terminalIcon")?.trim() : cfg.get<string>("terminalIcon")?.trim()) || (agent === "claude" ? "hubot" : "sparkle");
 		const colorId = cfg.get<string>("terminalColor")?.trim();
 		const color = colorId ? new vscode.ThemeColor(colorId) : undefined;
 
@@ -309,7 +335,7 @@ export class TerminalTracker implements vscode.Disposable {
 			// No `name`: a fixed name would pin the tab label. Without one, the tab follows
 			// the title omp sets (`π > <session title>`) when `terminal.integrated.tabs.title`
 			// includes `${sequence}`.
-			shellPath: ompExecutable(),
+			shellPath: agent === "claude" ? claudeExecutable() : ompExecutable(),
 			shellArgs: args,
 			cwd: opts.cwd && fs.existsSync(opts.cwd) ? opts.cwd : undefined,
 			env,
@@ -329,8 +355,9 @@ export class TerminalTracker implements vscode.Disposable {
 		// A fresh terminal is never tracked yet, so track() always returns an entry here.
 		const entry = this.track(terminal, key, opts.cwd ?? "", opts.sessionFile)!;
 		entry.launchedAt = launchedAt;
+		entry.agent = agent;
 		if (inPanel) terminal.show(opts.preserveFocus);
-		this.log.info(`[${key.slice(0, 8)}] ${opts.sessionFile ? `${reopen.slice(2)} ${opts.sessionFile}` : "new session"} in ${inPanel ? "panel" : "editor"}; terminal created ${this.since(entry)}`);
+		this.log.info(`[${key.slice(0, 8)}] ${agent} ${opts.sessionFile ? `${reopen.slice(2)} ${opts.sessionFile}` : "new session"} in ${inPanel ? "panel" : "editor"}; terminal created ${this.since(entry)}`);
 		void terminal.processId.then((pid) => this.log.info(`[${key.slice(0, 8)}] process ${pid ?? "(none)"} started ${this.since(entry)}`));
 		this.watchForReport(entry);
 		this.save();
@@ -411,13 +438,19 @@ export class TerminalTracker implements vscode.Disposable {
 			if (!alive || entry.reported) return;
 			entry.stalled = true;
 			this.changed.fire();
-			this.log.warn(`[${entry.key.slice(0, 8)}] omp has not reported ${this.since(entry)}; check that it can load ${this.hookPath} with -e`);
+			const claude = entry.agent === "claude";
+			const hint = claude
+				? `check that ~/.claude/settings.json runs ${this.claudeHookPath} for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop and SessionEnd`
+				: `check that it can load ${this.hookPath} with -e`;
+			this.log.warn(`[${entry.key.slice(0, 8)}] ${claude ? "claude" : "omp"} has not reported ${this.since(entry)}; ${hint}`);
 			if (this.warnedUnreported) return;
 			this.warnedUnreported = true;
 			void vscode.window
 				.showWarningMessage(
-					"omp has not reported its session, so this terminal will not be restored and shows no status. " +
-						`Check that this omp version can load extensions with -e (${this.hookPath}).`,
+					claude
+						? `Claude Code has not reported its session, so this terminal will not be restored and shows no status. Check that its hooks run ${this.claudeHookPath}.`
+						: "omp has not reported its session, so this terminal will not be restored and shows no status. " +
+								`Check that this omp version can load extensions with -e (${this.hookPath}).`,
 					"Show Log",
 				)
 				.then((choice) => {

@@ -129,7 +129,7 @@ test('sidebar identity cache', async (t) => {
         assert.deepEqual(first.find(item => item.id === 'one'), {
             file: alias, id: 'one', title: 'one', detail: 'bucket', time: fs.statSync(target).mtimeMs,
             cwd: path.dirname(target), state: 'working', pinned: true, missing: false,
-            unreadCompletion: true, ownerId: 'owner', terminalKey: 'local-key', kind: 'local', current: true,
+            unreadCompletion: true, ownerId: 'owner', terminalKey: 'local-key', kind: 'local', agent: 'omp', current: true,
         });
         assert.equal(first.find(item => item.id === 'gone').missing, true);
         const count = f.calls();

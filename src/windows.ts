@@ -6,7 +6,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { SessionAttention } from "./attention";
 import { agentDir, normPath, terminalMapDir } from "./config";
-import type { SessionIndex } from "./sessions";
+import type { SessionCatalog } from "./sessions";
 import type { LaunchOptions, OpenSession, ReleasedSession, SessionState, TerminalTracker } from "./tracker";
 
 const VERSION = 1;
@@ -224,7 +224,7 @@ export class WindowSessions implements vscode.Disposable {
 		private readonly ctx: vscode.ExtensionContext,
 		private readonly tracker: TerminalTracker,
 		private readonly attention: SessionAttention,
-		private readonly index: SessionIndex,
+		private readonly index: SessionCatalog,
 	) {
 		this.disposables.push(
 			index.onDidChangeFiles((file) => {

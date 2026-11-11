@@ -2,7 +2,7 @@
   "name": "omp-manager",
   "displayName": "OMP Session Manager",
   "description": "Oh My Pi sidebar: usage limits, session history, one-click resume, and terminal restore across VS Code restarts.",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "publisher": "mystravil",
   "license": "MIT",
   "repository": {
@@ -61,6 +61,12 @@
         "title": "New Session",
         "category": "OMP",
         "icon": "$(add)"
+      },
+      {
+        "command": "omp.newClaudeSession",
+        "title": "New Claude Code Session",
+        "category": "OMP",
+        "icon": "$(hubot)"
       },
       {
         "command": "omp.newSessionFromEditorTitle",
@@ -123,6 +129,11 @@
         "command": "omp.focusNextWaiting",
         "title": "Focus Next Session Needing Input",
         "category": "OMP"
+      },
+      {
+        "command": "omp.copyClaudeHooks",
+        "title": "Copy Claude Code Hooks JSON",
+        "category": "OMP"
       }
     ],
     "keybindings": [
@@ -147,6 +158,11 @@
         {
           "command": "omp.newSession",
           "when": "view == omp.main",
+          "group": "navigation@1"
+        },
+        {
+          "command": "omp.newClaudeSession",
+          "when": "view == omp.main && config.omp.claude.enabled",
           "group": "navigation@1"
         },
         {
@@ -331,6 +347,34 @@
             "type": "boolean",
             "default": true,
             "description": "Open the OMP sidebar when VS Code starts. VS Code otherwise restores the last active view, so new windows and folders open on Explorer."
+          },
+          "omp.claude.enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "List Claude Code sessions (from ~/.claude/projects) next to omp's, resume them with `claude --resume`, and show their live status. Status needs the hook from **OMP: Copy Claude Code Hooks JSON** in ~/.claude/settings.json. Applies after reloading the window."
+          },
+          "omp.claude.executable": {
+            "type": "string",
+            "default": "",
+            "description": "Path to the claude executable. Empty: `claude` on PATH, then ~/.local/bin/claude."
+          },
+          "omp.claude.projectsDir": {
+            "type": "string",
+            "default": "",
+            "description": "Claude Code transcripts directory. Empty: $CLAUDE_CONFIG_DIR/projects or ~/.claude/projects."
+          },
+          "omp.claude.extraArgs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "Arguments passed to every claude the extension starts, before --resume."
+          },
+          "omp.claude.terminalIcon": {
+            "type": "string",
+            "default": "hubot",
+            "description": "Codicon id for Claude Code terminal tabs."
           }
         }
       },

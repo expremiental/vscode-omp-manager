@@ -27,7 +27,37 @@ export function terminalMapDir(): string {
 
 /** Resolves the omp executable against PATH so it can be the terminal's process. */
 export function ompExecutable(): string {
-	const configured = expandHome(setting("executable") || "omp");
+	return resolveExecutable(setting("executable") || "omp");
+}
+
+/** Claude Code's transcripts: `<projects>/<project slug>/<session id>.jsonl`. */
+export function claudeProjectsDir(): string {
+	const configured = setting("claude.projectsDir");
+	if (configured) return expandHome(configured);
+	const configDir = process.env.CLAUDE_CONFIG_DIR?.trim();
+	return path.join(configDir ? expandHome(configDir) : path.join(os.homedir(), ".claude"), "projects");
+}
+
+/** Whether Claude Code sessions are listed and tracked alongside omp's. */
+export function claudeEnabled(): boolean {
+	return vscode.workspace.getConfiguration("omp").get<boolean>("claude.enabled", true);
+}
+
+/**
+ * The claude executable. The extension host's PATH often lacks ~/.local/bin, where the
+ * native installer puts it, so that is tried after PATH.
+ */
+export function claudeExecutable(): string {
+	const configured = setting("claude.executable");
+	if (configured) return resolveExecutable(configured);
+	const resolved = resolveExecutable("claude");
+	if (resolved !== "claude") return resolved;
+	const local = path.join(os.homedir(), ".local", "bin", "claude");
+	return fs.existsSync(local) ? local : resolved;
+}
+
+function resolveExecutable(name: string): string {
+	const configured = expandHome(name);
 	if (path.isAbsolute(configured) || configured.includes("/") || configured.includes("\\")) return configured;
 	const exts = process.platform === "win32" ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";") : [""];
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {

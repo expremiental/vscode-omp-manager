@@ -5,8 +5,8 @@ import * as vscode from "vscode";
 import type { SessionAttention } from "./attention";
 import { isWithin } from "./config";
 import type { SessionPins } from "./pins";
-import { type SessionIndex, type SessionInfo, parseSession } from "./sessions";
-import type { SessionState, TerminalTracker } from "./tracker";
+import { type AgentKind, type SessionCatalog, type SessionInfo, parseAnySession } from "./sessions";
+import { type SessionState, type TerminalTracker, agentOf } from "./tracker";
 import { refreshMinutes, showPace, type UsageService, visibleProviders, warnPercent } from "./usage";
 import type { SessionKind, SessionTarget, WindowSessions } from "./windows";
 import { worktreeFolders } from "./worktrees";
@@ -90,6 +90,7 @@ html { scrollbar-color: auto; }
 .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail { display: block; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .time { flex: none; font-size: 11px; }
+.agent { flex: none; font-size: 9px; font-weight: 600; line-height: 12px; padding: 0 3px; border-radius: 3px; box-shadow: inset 0 0 0 1px currentColor; opacity: .75; }
 .dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: transparent; }
 .dot.idle, .dot.unknown { box-shadow: inset 0 0 0 1px var(--vscode-descriptionForeground); }
 .dot.working { background: currentColor; animation: pulse 1.2s ease-in-out infinite; }
@@ -261,9 +262,10 @@ function rowHtml(s, detail) {
 		? "Завершил · не просмотрено" + (s.state === "idle" ? "" : " · " + (STATE_LABEL[s.state] || STATE_LABEL.unknown))
 		: s.missing ? "Файл сессии недоступен" : s.kind === "unavailable" ? "Окно недоступно · статус неизвестен" : STATE_LABEL[s.state] || STATE_LABEL.unknown;
 	return '<button class="item' + (highlight ? " " + highlight : "") + '" tabindex="-1" data-missing="' + !!s.missing + '" data-file="' + esc(s.file) + '" data-owner="' + esc(s.ownerId || "") + '" data-terminal="' + esc(s.terminalKey || "") + '" data-vscode-context="' + esc(JSON.stringify(ctx)) + '"'
-		+ ' title="' + esc(s.title) + " — " + esc(status) + '">'
+		+ ' title="' + (s.agent === "claude" ? "Claude Code · " : "") + esc(s.title) + " — " + esc(status) + '">'
 		+ '<span class="dot' + ((highlight || s.state) ? " " + (highlight || s.state) : "") + '"></span>'
 		+ '<span class="title">' + esc(s.title) + (detail ? '<span class="detail muted">' + esc(detail) + '</span>' : "") + '</span>'
+		+ (s.agent === "claude" ? '<span class="agent" aria-label="Claude Code">CC</span>' : "")
 		+ '<span class="time muted">' + ago(s.time) + '</span></button>';
 }
 let renderedHtml, pointerActive = false, pendingRender = false, pointerEnd;
@@ -442,10 +444,11 @@ interface SessionItem {
 	kind?: SessionKind;
 	/** Runs in the terminal selected in this window. */
 	current?: boolean;
+	agent: AgentKind;
 }
 
 /** A listing candidate: an indexed session, a live one not indexed yet, or a missing bookmark. */
-type Candidate = Pick<SessionInfo, "file" | "id" | "title" | "cwd" | "created" | "modified"> & { missing?: boolean };
+type Candidate = Pick<SessionInfo, "file" | "id" | "title" | "cwd" | "created" | "modified"> & { agent?: AgentKind; missing?: boolean };
 
 /** What a webview row click posts. */
 interface OpenMessage extends SessionTarget {
@@ -465,7 +468,7 @@ function folderLabel(folder: vscode.WorkspaceFolder | undefined, rel: string, ro
  * their repositories' other git worktrees (every session with scope "all" or when no folder is
  * open), empty ones only with showEmpty, newest first by sortBy.
  */
-export function workspaceSessions(index: SessionIndex): SessionInfo[] {
+export function workspaceSessions(index: SessionCatalog): SessionInfo[] {
 	const config = vscode.workspace.getConfiguration("omp");
 	const all = config.get<string>("sessions.scope", "workspace") === "all";
 	const folders = all ? [] : (vscode.workspace.workspaceFolders?.flatMap((f) => worktreeFolders(f.uri.fsPath)) ?? []);
@@ -483,7 +486,7 @@ export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Dispo
 	private readonly subs: vscode.Disposable[] = [];
 
 	constructor(
-		private readonly index: SessionIndex,
+		private readonly index: SessionCatalog,
 		private readonly tracker: TerminalTracker,
 		private readonly usage: UsageService,
 		/** `cwd`: set when started from a folder group's header. */
@@ -618,7 +621,7 @@ export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Dispo
 			// Explicit bookmarks can point outside the session index's scanned directories.
 			let saved: SessionInfo | null | undefined;
 			try {
-				saved = parseSession(pin.file, fs.statSync(pin.file).mtimeMs);
+				saved = parseAnySession(pin.file, fs.statSync(pin.file).mtimeMs);
 			} catch {
 				// Missing or unreadable: shown as an unavailable bookmark below.
 			}
@@ -654,6 +657,7 @@ export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Dispo
 				ownerId: live?.ownerId,
 				terminalKey: live?.terminalKey,
 				kind: live?.kind,
+				agent: s.agent ?? agentOf(s.file),
 			};
 			item.current = !!selected && identity === selectedFile && live?.kind === "local" && live.terminalKey === selected[1].terminalKey;
 			if (groupBy === "folder") item.folder = folderLabel(folder, rel, folders.length);

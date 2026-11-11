@@ -2,9 +2,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import * as vscode from "vscode";
-import { normPath, sessionsDir } from "./config";
+import { isWithin, normPath, sessionsDir } from "./config";
+
+/** Which CLI agent wrote a transcript, and so how to resume it. */
+export type AgentKind = "omp" | "claude";
 
 export interface SessionInfo {
+	agent: AgentKind;
 	id: string;
 	file: string;
 	cwd: string;
@@ -76,6 +80,7 @@ export function parseSession(file: string, mtimeMs: number): SessionInfo | null 
 	}
 	const created = typeof header.timestamp === "string" ? Date.parse(header.timestamp) : NaN;
 	return {
+		agent: "omp",
 		id: header.id,
 		file,
 		cwd: header.cwd,
@@ -86,9 +91,130 @@ export function parseSession(file: string, mtimeMs: number): SessionInfo | null 
 	};
 }
 
+// Claude Code transcripts open with metadata records (mode, owner, file snapshots) whose
+// size varies, so the head is read in chunks until the first real prompt shows up.
+const CLAUDE_CHUNK = 64 * 1024;
+const CLAUDE_HEAD_MAX = 1024 * 1024;
+// Claude appends `ai-title` / `custom-title` records as the session goes; the latest wins.
+const CLAUDE_TAIL = 64 * 1024;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function readRange(fd: number, start: number, length: number): string {
+	const buf = Buffer.allocUnsafe(length);
+	const n = fs.readSync(fd, buf, 0, length, start);
+	return buf.subarray(0, n).toString("utf8");
+}
+
+/** Complete JSON lines of `text`; a cut-off first or last line is dropped. */
+function* records(text: string, skipFirst: boolean): Generator<Record<string, unknown>> {
+	const lines = text.split("\n");
+	if (skipFirst) lines.shift();
+	for (const line of lines) {
+		if (!line) continue;
+		try {
+			const entry = JSON.parse(line);
+			if (entry && typeof entry === "object") yield entry;
+		} catch {
+			// partial line at a chunk edge
+		}
+	}
+}
+
+/** The text a user typed, or "" for tool results, slash-command echoes and other plumbing. */
+function promptText(entry: Record<string, unknown>): string {
+	if (entry.type !== "user" || entry.isMeta === true || entry.isSidechain === true) return "";
+	const message = entry.message as { content?: unknown } | undefined;
+	let text = "";
+	if (typeof message?.content === "string") text = message.content;
+	else if (Array.isArray(message?.content)) {
+		const block = message.content.find((b) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string");
+		text = block?.text ?? "";
+	}
+	text = text.trim();
+	// `<command-name>`, `<local-command-stdout>` and similar wrap slash commands, not prompts.
+	return /^<[a-z-]+>/.test(text) ? "" : text;
+}
+
+function titleOf(entry: Record<string, unknown>): { custom?: string; ai?: string } {
+	if (entry.type === "custom-title") {
+		const title = entry.customTitle ?? entry.title;
+		return typeof title === "string" && title.trim() ? { custom: title } : {};
+	}
+	if (entry.type === "ai-title" && typeof entry.aiTitle === "string" && entry.aiTitle.trim()) return { ai: entry.aiTitle };
+	return {};
+}
+
+/** Claude Code transcript: id, cwd and start from the head, title from the tail. Null for foreign files. */
+export function parseClaudeSession(file: string, mtimeMs: number): SessionInfo | null {
+	const fd = fs.openSync(file, "r");
+	try {
+		const size = fs.fstatSync(fd).size;
+		let id: string | undefined;
+		let cwd: string | undefined;
+		let timestamp: string | undefined;
+		let prompt = "";
+		let custom: string | undefined;
+		let ai: string | undefined;
+		let carry = "";
+		let offset = 0;
+		while (offset < Math.min(size, CLAUDE_HEAD_MAX) && !(id && cwd && prompt)) {
+			const text = carry + readRange(fd, offset, CLAUDE_CHUNK);
+			offset += CLAUDE_CHUNK;
+			const cut = offset < size ? text.lastIndexOf("\n") + 1 : text.length;
+			carry = text.slice(cut);
+			for (const entry of records(text.slice(0, cut), false)) {
+				if (!id && typeof entry.sessionId === "string") id = entry.sessionId;
+				if (!cwd && typeof entry.cwd === "string" && entry.cwd) cwd = entry.cwd;
+				if (!timestamp && typeof entry.timestamp === "string") timestamp = entry.timestamp;
+				if (!prompt) prompt = promptText(entry);
+				const t = titleOf(entry);
+				custom = t.custom ?? custom;
+				ai = t.ai ?? ai;
+			}
+		}
+		if (offset < size) {
+			const start = Math.max(offset, size - CLAUDE_TAIL);
+			for (const entry of records(readRange(fd, start, size - start), start > 0)) {
+				const t = titleOf(entry);
+				custom = t.custom ?? custom;
+				ai = t.ai ?? ai;
+			}
+		}
+		const base = path.basename(file, ".jsonl");
+		if (!cwd || !(id || UUID_RE.test(base))) return null;
+		const title = custom || ai || prompt;
+		const created = timestamp ? Date.parse(timestamp) : NaN;
+		return {
+			agent: "claude",
+			// `claude --resume` takes the id the file is named after.
+			id: UUID_RE.test(base) ? base : (id as string),
+			file,
+			cwd,
+			title: title ? oneLine(title) : EMPTY_TITLE,
+			empty: !prompt && !custom && !ai,
+			created: Number.isFinite(created) ? created : mtimeMs,
+			modified: mtimeMs,
+		};
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+const PARSERS: Record<AgentKind, (file: string, mtimeMs: number) => SessionInfo | null> = {
+	omp: parseSession,
+	claude: parseClaudeSession,
+};
+
+/** A transcript of either agent, for files outside any index (e.g. moved pinned sessions). */
+export function parseAnySession(file: string, mtimeMs: number): SessionInfo | null {
+	return parseSession(file, mtimeMs) ?? parseClaudeSession(file, mtimeMs);
+}
+
 export interface SessionIndexOptions {
 	root?: string;
 	debounceMs?: number;
+	/** Transcript format under `root`; omp by default. */
+	agent?: AgentKind;
 }
 
 /**
@@ -102,7 +228,9 @@ export interface SessionIndexOptions {
  * rescan per change would cost time proportional to the whole history.
  */
 export class SessionIndex implements vscode.Disposable {
-	private readonly root: string;
+	readonly root: string;
+	readonly agent: AgentKind;
+	private readonly parse: (file: string, mtimeMs: number) => SessionInfo | null;
 	/** `root` with links resolved; set on the first symlinked transcript. */
 	private realRoot: string | undefined;
 	private readonly debounceMs: number;
@@ -125,6 +253,8 @@ export class SessionIndex implements vscode.Disposable {
 
 	constructor(opts: SessionIndexOptions = {}) {
 		this.root = opts.root ?? sessionsDir();
+		this.agent = opts.agent ?? "omp";
+		this.parse = PARSERS[this.agent];
 		this.debounceMs = opts.debounceMs ?? DEBOUNCE_MS;
 		this.watch();
 	}
@@ -198,7 +328,7 @@ export class SessionIndex implements vscode.Disposable {
 		if (cached?.mtimeMs === mtimeMs) return false;
 		let info: SessionInfo | null = null;
 		try {
-			info = parseSession(file, mtimeMs);
+			info = this.parse(file, mtimeMs);
 		} catch {
 			// unreadable; retried on the next change
 		}
@@ -279,7 +409,7 @@ export class SessionIndex implements vscode.Disposable {
 		const cached = this.cache.get(normPath(file));
 		if (cached) return cached.info ?? undefined;
 		try {
-			return parseSession(file, fs.statSync(file).mtimeMs) ?? undefined;
+			return this.parse(file, fs.statSync(file).mtimeMs) ?? undefined;
 		} catch {
 			return undefined;
 		}
@@ -288,6 +418,60 @@ export class SessionIndex implements vscode.Disposable {
 	dispose(): void {
 		clearTimeout(this.debounce);
 		this.watcher?.close();
+		this.changed.dispose();
+		this.filesChanged.dispose();
+	}
+}
+
+/** What the sidebar, the window registry and commands read: one index or several merged. */
+export type SessionCatalog = Pick<SessionIndex, "list" | "find" | "ensure" | "onDidChange" | "onDidChangeFiles"> & vscode.Disposable;
+
+/** omp's and Claude Code's indexes as one listing, most recently modified first. */
+export class SessionIndexes implements SessionCatalog {
+	private sorted: SessionInfo[] | undefined;
+	private readonly changed = new vscode.EventEmitter<void>();
+	readonly onDidChange = this.changed.event;
+	private readonly filesChanged = new vscode.EventEmitter<string | undefined>();
+	readonly onDidChangeFiles = this.filesChanged.event;
+	private readonly subs: vscode.Disposable[] = [];
+
+	constructor(private readonly sources: SessionIndex[]) {
+		for (const source of sources) {
+			this.subs.push(
+				source.onDidChange(() => {
+					this.sorted = undefined;
+					this.changed.fire();
+				}),
+				source.onDidChangeFiles((file) => this.filesChanged.fire(file)),
+			);
+		}
+	}
+
+	async ensure(): Promise<void> {
+		await Promise.all(this.sources.map((s) => s.ensure()));
+	}
+
+	list(): SessionInfo[] {
+		if (!this.sorted) {
+			this.sorted = this.sources.flatMap((s) => s.list());
+			this.sorted.sort((a, b) => b.modified - a.modified);
+		}
+		return this.sorted;
+	}
+
+	find(file: string): SessionInfo | undefined {
+		const owner = this.sources.find((s) => isWithin(file, s.root));
+		if (owner) return owner.find(file);
+		for (const source of this.sources) {
+			const info = source.find(file);
+			if (info) return info;
+		}
+		return undefined;
+	}
+
+	dispose(): void {
+		for (const sub of this.subs) sub.dispose();
+		for (const source of this.sources) source.dispose();
 		this.changed.dispose();
 		this.filesChanged.dispose();
 	}
