@@ -1,10 +1,14 @@
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { isWithin, normPath } from "./config";
-import type { SessionIndex, SessionInfo } from "./sessions";
+import type { SessionAttention } from "./attention";
+import { isWithin } from "./config";
+import type { SessionPins } from "./pins";
+import { type SessionIndex, type SessionInfo, parseSession } from "./sessions";
 import type { SessionState, TerminalTracker } from "./tracker";
 import { refreshMinutes, showPace, type UsageService, visibleProviders, warnPercent } from "./usage";
+import type { SessionKind, SessionTarget, WindowSessions } from "./windows";
 import { worktreeFolders } from "./worktrees";
 
 // One webview holds both sections. Separate VS Code views split the sidebar height
@@ -74,15 +78,22 @@ html { scrollbar-color: auto; }
 #list:hover, #list.scrolling { --thumb: var(--vscode-scrollbarSlider-background); }
 #list::-webkit-scrollbar-thumb:hover { background-color: var(--vscode-scrollbarSlider-hoverBackground); }
 #list::-webkit-scrollbar-thumb:active { background-color: var(--vscode-scrollbarSlider-activeBackground); }
-.item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 5px 4px; border-radius: 4px; text-align: left; }
+.item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px; border-radius: 4px; text-align: left; }
+.item + .item { margin-top: 2px; }
 .item:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.item.working { background: #ffe396; }
+.item.unread { background: #79cc85; }
+.item.waiting { background: #b798ed; }
+.item.current { box-shadow: inset 0 0 0 2px #2459b3; }
+.item.working, .item.unread, .item.waiting { color: #1f2328; }
+.item.working .muted, .item.unread .muted, .item.waiting .muted { color: #303a44; }
 .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail { display: block; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .time { flex: none; font-size: 11px; }
 .dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: transparent; }
-.dot.idle { background: var(--vscode-testing-iconPassed, #3fb950); }
-.dot.working { background: var(--vscode-progressBar-background, #0078d4); animation: pulse 1.2s ease-in-out infinite; }
-.dot.waiting { background: var(--vscode-editorWarning-foreground, #cca700); }
+.dot.idle, .dot.unknown { box-shadow: inset 0 0 0 1px var(--vscode-descriptionForeground); }
+.dot.working { background: currentColor; animation: pulse 1.2s ease-in-out infinite; }
+.dot.waiting, .dot.unread { background: currentColor; }
 /* Resumed, and omp has not reported yet: it can take several seconds to boot and paint. */
 .dot.launching { box-shadow: inset 0 0 0 1px var(--vscode-descriptionForeground); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: .3; } }
@@ -222,11 +233,11 @@ function group(ms) {
 	if (ms >= start - 6 * day) return "This week";
 	return "Older";
 }
-const STATE_LABEL = { launching: "open, starting", idle: "open, idle", working: "open, working", waiting: "open, needs input" };
+const STATE_LABEL = { launching: "Запускается", idle: "Не работает", working: "Работает", waiting: "Ждёт ответа", unknown: "Статус неизвестен" };
 // Collapsed groups by key; ignored while searching so every match shows.
 state.groups = state.groups || {};
 function headHtml(key, label, count, collapsed, cwd) {
-	if (groupBy === "none") return "";
+	if (groupBy === "none" && key !== "pinned" && key !== "unpinned") return "";
 	const cut = Math.max(0, label.lastIndexOf("/"), label.lastIndexOf("\\\\"));
 	return '<div class="group' + (collapsed ? " collapsed" : "") + '">'
 		+ '<button class="gtoggle" tabindex="-1" data-group="' + esc(key) + '" aria-expanded="' + !collapsed + '" title="' + esc(label) + '">' + CHEVRON
@@ -235,51 +246,108 @@ function headHtml(key, label, count, collapsed, cwd) {
 		+ (cwd ? '<button class="gnew" data-cwd="' + esc(cwd) + '" title="New session in ' + esc(label) + '" aria-label="New session in ' + esc(label) + '">' + PLUS + '</button>' : "")
 		+ '</div>';
 }
+function sessionPriority(s) {
+	return s.state === "waiting" ? 0 : s.state === "working" ? 2 : s.unreadCompletion ? 1 : 3;
+}
 function groupHtml(key, label, members, detail, cwd) {
 	const collapsed = !searching && !!state.groups[key];
-	return headHtml(key, label, members.length, collapsed, cwd) + (collapsed ? "" : members.map(s => rowHtml(s, detail(s))).join(""));
+	return headHtml(key, label, members.length, collapsed, cwd) + (collapsed ? "" : members.sort((a, b) => sessionPriority(a) - sessionPriority(b) || b.time - a.time).map(s => rowHtml(s, detail(s))).join(""));
 }
 let searching = false;
 function rowHtml(s, detail) {
-	const ctx = { webviewSection: "session", file: s.file, id: s.id, sessionOpen: !!s.state, preventDefaultContextMenuItems: true };
-	return '<button class="item" tabindex="-1" data-file="' + esc(s.file) + '" data-vscode-context="' + esc(JSON.stringify(ctx)) + '"'
-		+ ' title="' + esc(s.title) + (s.state ? " (" + STATE_LABEL[s.state] + ")" : "") + '">'
-		+ '<span class="dot' + (s.state ? " " + s.state : "") + '"></span>'
+	const ctx = { webviewSection: "session", file: s.file, id: s.id, ownerId: s.ownerId, terminalKey: s.terminalKey, sessionOpen: !!s.state, sessionPinned: !!s.pinned, sessionMissing: !!s.missing, preventDefaultContextMenuItems: true };
+	const highlight = s.state === "working" ? "working" : s.state === "waiting" ? "waiting" : s.unreadCompletion ? "unread" : "";
+	const status = highlight === "unread"
+		? "Завершил · не просмотрено" + (s.state === "idle" ? "" : " · " + (STATE_LABEL[s.state] || STATE_LABEL.unknown))
+		: s.missing ? "Файл сессии недоступен" : s.kind === "unavailable" ? "Окно недоступно · статус неизвестен" : STATE_LABEL[s.state] || STATE_LABEL.unknown;
+	return '<button class="item' + (highlight ? " " + highlight : "") + '" tabindex="-1" data-missing="' + !!s.missing + '" data-file="' + esc(s.file) + '" data-owner="' + esc(s.ownerId || "") + '" data-terminal="' + esc(s.terminalKey || "") + '" data-vscode-context="' + esc(JSON.stringify(ctx)) + '"'
+		+ ' title="' + esc(s.title) + " — " + esc(status) + '">'
+		+ '<span class="dot' + ((highlight || s.state) ? " " + (highlight || s.state) : "") + '"></span>'
 		+ '<span class="title">' + esc(s.title) + (detail ? '<span class="detail muted">' + esc(detail) + '</span>' : "") + '</span>'
 		+ '<span class="time muted">' + ago(s.time) + '</span></button>';
 }
+let renderedHtml, pointerActive = false, pendingRender = false, pointerEnd;
+function decorateCurrent() {
+	const selected = items && items.find(s => s.current);
+	for (const row of list.querySelectorAll(".item")) {
+		const current = !!selected && row.dataset.file === selected.file
+			&& row.dataset.owner === (selected.ownerId || "")
+			&& row.dataset.terminal === (selected.terminalKey || "")
+			&& row.dataset.missing !== "true";
+		row.classList.toggle("current", current);
+		row.setAttribute("aria-current", String(current));
+	}
+}
+function commitSessions(html) {
+	// Current-only updates must preserve the pressed button and its descendants.
+	if (html === renderedHtml) { decorateCurrent(); return; }
+	// Genuine status/content updates wait until the browser has dispatched click.
+	if (pointerActive) { pendingRender = true; decorateCurrent(); return; }
+	const active = document.hasFocus() ? document.activeElement : null;
+	const focused = active && list.contains(active)
+		? active.classList.contains("item") ? "f:" + active.dataset.file
+		: active.classList.contains("gtoggle") ? "g:" + active.dataset.group : null
+		: null;
+	list.innerHTML = html;
+	renderedHtml = html;
+	decorateCurrent();
+	const rows = navRows();
+	const again = focused === null ? undefined : rows.find(r => (r.classList.contains("item") ? "f:" + r.dataset.file : "g:" + r.dataset.group) === focused);
+	if (rows.length) (again || rows[0]).tabIndex = 0;
+	if (again && document.hasFocus()) again.focus({ preventScroll: true });
+}
+list.addEventListener("pointerdown", e => {
+	if (e.button !== 0 || e.ctrlKey) return;
+	clearTimeout(pointerEnd);
+	pointerActive = true;
+});
+function finishPointer() {
+	clearTimeout(pointerEnd);
+	pointerEnd = setTimeout(() => {
+		pointerActive = false;
+		if (pendingRender) { pendingRender = false; renderSessions(); }
+	}, 0);
+}
+window.addEventListener("pointerup", finishPointer);
+window.addEventListener("pointercancel", finishPointer);
+window.addEventListener("blur", finishPointer);
+list.addEventListener("contextmenu", finishPointer);
 function renderSessions() {
-	if (items === null) { list.innerHTML = '<div class="muted">Loading…</div>'; return; }
+	if (items === null) { commitSessions('<div class="muted">Loading…</div>'); return; }
 	const needle = q.value.trim().toLowerCase();
 	searching = !!needle;
-	const matched = needle ? items.filter(s => (s.title + " " + s.detail).toLowerCase().includes(needle)) : items;
-	if (!matched.length) { list.innerHTML = '<div class="muted">' + (items.length ? "No matching sessions" : "No sessions yet") + '</div>'; return; }
-	// Open sessions lead; the rest keep their order inside their group. Only matched rows are
-	// grouped, so a group the search empties loses its header too.
-	const open = [], groups = new Map();
+	const matches = s => (s.title + " " + (s.detail || "")).toLowerCase().includes(needle);
+	const matched = needle ? items.filter(matches) : items;
+	if (!matched.length) { commitSessions('<div class="muted">' + (items.length ? "No matching sessions" : "No sessions yet") + '</div>'); return; }
+	// Explicit bookmarks precede ordinary history; search preserves section membership.
+	const recentFiles = new Set(groupBy === "folder"
+		? items.filter(s => !s.state && !s.pinned).sort((a, b) => b.time - a.time).slice(0, 10).map(s => s.file)
+		: []);
+	const pinned = [], open = [], recent = [], groups = new Map();
 	for (const s of matched) {
+		if (s.pinned) { pinned.push(s); continue; }
 		if (s.state) { open.push(s); continue; }
+		if (recentFiles.has(s.file)) { recent.push(s); continue; }
 		const g = groupBy === "none" ? "" : groupBy === "folder" ? s.folder : group(s.time);
 		const members = groups.get(g);
 		if (members) members.push(s);
 		else groups.set(g, [s]);
 	}
-	// Live sessions re-render this list about once a second; keep keyboard focus on the same row or header.
-	const active = document.activeElement;
-	const focused = active && active.classList.contains("item") ? "f:" + active.dataset.file : active && active.classList.contains("gtoggle") ? "g:" + active.dataset.group : null;
-	let html = open.length ? groupHtml("open", "Open", open, s => s.detail) : "";
-	// A folder header already names the folder each row's detail would repeat, and can start a session there.
-	for (const [label, members] of groups) {
-		html += groupBy === "folder"
-			? groupHtml("folder:" + label, label, members, () => "", members[0].cwd)
-			: groupHtml(groupBy + ":" + label, label, members, s => s.detail);
+	let html = pinned.length ? groupHtml("pinned", "Pinned", pinned, s => s.detail) : "";
+	if (groupBy === "none" && pinned.length) {
+		const unpinned = matched.filter(s => !s.pinned);
+		if (unpinned.length) html += groupHtml("unpinned", "Sessions", unpinned, s => s.detail);
+	} else {
+		if (open.length) html += groupHtml("open", "Open", open, s => s.detail);
+		if (recent.length) html += groupHtml("recent", "Recent", recent, s => s.detail);
+		// Folder headers already name the folder and can start a session there.
+		for (const [label, members] of groups) {
+			html += groupBy === "folder"
+				? groupHtml("folder:" + label, label, members, () => "", members[0].cwd)
+				: groupHtml(groupBy + ":" + label, label, members, s => s.detail);
+		}
 	}
-	list.innerHTML = html;
-	const rows = navRows();
-	const again = focused === null ? undefined : rows.find(r => (r.classList.contains("item") ? "f:" + r.dataset.file : "g:" + r.dataset.group) === focused);
-	// One row is tabbable (roving tabindex); arrows move between rows and group headers.
-	if (rows.length) (again || rows[0]).tabIndex = 0;
-	if (again) again.focus({ preventScroll: true });
+	commitSessions(html);
 }
 function navRows() { return [...list.querySelectorAll(".item, .gtoggle")]; }
 function focusRow(row) {
@@ -303,7 +371,7 @@ list.addEventListener("click", e => {
 		return;
 	}
 	const el = e.target.closest(".item");
-	if (el) vscode.postMessage({ type: "open", file: el.dataset.file });
+	if (el) vscode.postMessage({ type: "open", file: el.dataset.file, sessionMissing: el.dataset.missing === "true", ownerId: el.dataset.owner || undefined, terminalKey: el.dataset.terminal || undefined });
 });
 list.addEventListener("keydown", e => {
 	const rows = navRows();
@@ -363,6 +431,25 @@ interface SessionItem {
 	cwd: string;
 	/** Set only for sessions open in a terminal; "launching" until omp first reports. */
 	state?: SessionState | "launching";
+	pinned: boolean;
+	/** A pinned bookmark whose transcript file is gone. */
+	missing: boolean;
+	/** Finished while nobody was looking at its terminal. */
+	unreadCompletion: boolean;
+	/** The live owner window and terminal, when open in any window. */
+	ownerId?: string;
+	terminalKey?: string;
+	kind?: SessionKind;
+	/** Runs in the terminal selected in this window. */
+	current?: boolean;
+}
+
+/** A listing candidate: an indexed session, a live one not indexed yet, or a missing bookmark. */
+type Candidate = Pick<SessionInfo, "file" | "id" | "title" | "cwd" | "created" | "modified"> & { missing?: boolean };
+
+/** What a webview row click posts. */
+interface OpenMessage extends SessionTarget {
+	sessionMissing?: boolean;
 }
 
 /** A workspace root goes by its name; anything else by the path its row shows as detail. */
@@ -401,7 +488,22 @@ export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Dispo
 		private readonly usage: UsageService,
 		/** `cwd`: set when started from a folder group's header. */
 		private readonly onNew: (cwd?: string) => void,
+		private readonly attention: SessionAttention,
+		private readonly windows: WindowSessions,
+		private readonly pins: SessionPins,
 	) {
+		this.subs.push(pins.onDidChange(() => this.refreshSessions()));
+		this.subs.push(windows.onDidChange(() => this.refreshSessions()));
+		this.subs.push(attention.onDidChange(() => this.refreshSessions()));
+		// The current-session outline follows the selected terminal.
+		const refreshSelection = () => this.refreshSessions();
+		this.subs.push(
+			vscode.window.onDidChangeActiveTerminal(refreshSelection),
+			vscode.window.onDidCloseTerminal(refreshSelection),
+			vscode.window.tabGroups.onDidChangeTabs(refreshSelection),
+			vscode.window.tabGroups.onDidChangeTabGroups(refreshSelection),
+			vscode.window.onDidChangeWindowState(refreshSelection),
+		);
 		this.subs.push(
 			usage.onDidChange(() => this.postUsage()),
 			index.onDidChange(() => this.refreshSessions()),
@@ -427,9 +529,10 @@ export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Dispo
 				this.postUsage();
 				this.refreshSessions(true);
 			} else if (m?.type === "new") this.onNew(typeof m.cwd === "string" ? m.cwd : undefined);
-			else if (m?.type === "open" && typeof m.file === "string") this.open(m.file);
+			else if (m?.type === "open" && typeof m.file === "string") this.open(m.file, m);
 		});
 		view.onDidChangeVisibility(() => {
+			if (view.visible) this.pins.refresh();
 			this.scheduleUsage();
 			if (view.visible && this.sessionsDirty) this.refreshSessions();
 		});
@@ -479,27 +582,100 @@ export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Dispo
 		const max = Math.max(1, config.get<number>("sessions.maxShown", 300));
 		const groupBy = config.get<string>("sessions.groupBy", "date");
 		const sortBy = config.get<string>("sessions.sortBy", "modified") === "created" ? "created" : "modified";
-		const open = this.tracker.openSessions();
+		const open = this.windows.sessions();
+		const terminal = this.attention.selectedEditorTerminal();
+		const selected = terminal && [...this.tracker.openSessions()].find(([, session]) => session.terminal === terminal);
+		const selectedFile = selected && this.windows.identity(selected[0], true);
 		const folders = vscode.workspace.workspaceFolders ?? [];
 		const items: SessionItem[] = [];
-		for (const s of workspaceSessions(this.index)) {
-			const live = open.get(normPath(s.file));
-			// Open sessions always show, however old.
-			if (items.length >= max && !live) continue;
+		const candidates = new Map<string, Candidate>(workspaceSessions(this.index).map((s) => [this.windows.identity(s.file, true), s]));
+		// Pins bypass workspace scope and the history limit, including moved transcripts.
+		const foundPins = new Set<string>();
+		for (const s of this.index.list()) {
+			if (!this.pins.has(s.id)) continue;
+			foundPins.add(s.id);
+			candidates.set(this.windows.identity(s.file, true), s);
+		}
+		// Every owned session is visible, even outside this workspace or before its transcript is indexed.
+		for (const [file, live] of open) {
+			if (!candidates.has(file)) {
+				const indexed = this.index.find(live.file);
+				candidates.set(file, indexed ?? { file: live.file, id: live.id, title: live.title || path.basename(live.file), cwd: live.cwd || "", created: 0, modified: 0 });
+			}
+		}
+		for (const pin of this.pins.list()) {
+			if (foundPins.has(pin.id)) continue;
+			// A live owner can still focus its terminal while the transcript is unavailable.
+			const owned = [...open].find(([, live]) => live.id === pin.id);
+			if (owned) {
+				const [identity, live] = owned;
+				const indexed = this.index.find(live.file);
+				if (!indexed || indexed.id === pin.id) {
+					candidates.set(identity, indexed ?? { ...pin, file: live.file, created: 0, modified: 0 });
+					continue;
+				}
+			}
+			// Explicit bookmarks can point outside the session index's scanned directories.
+			let saved: SessionInfo | null | undefined;
+			try {
+				saved = parseSession(pin.file, fs.statSync(pin.file).mtimeMs);
+			} catch {
+				// Missing or unreadable: shown as an unavailable bookmark below.
+			}
+			if (saved?.id === pin.id) {
+				candidates.set(this.windows.identity(saved.file, true), saved);
+			} else {
+				// Never attach a bookmark to another session that reused its former path.
+				candidates.set(`missing:${pin.id}`, { ...pin, created: 0, modified: 0, missing: true });
+			}
+		}
+		let historyCount = 0;
+		for (const [identity, s] of candidates) {
+			const live = s.missing ? undefined : open.get(identity);
+			const pinned = this.pins.has(s.id);
+			// Open and pinned sessions do not consume the ordinary history allowance.
+			if (!live && !pinned && historyCount++ >= max) continue;
 			// Sessions from a subfolder (worktrees, scratch dirs) show where they ran.
 			const folder = folders.find((f) => isWithin(s.cwd, f.uri.fsPath));
 			const rel = folder ? path.relative(folder.uri.fsPath, s.cwd) : s.cwd;
-			const state = live ? (live.launching ? "launching" : (live.state ?? "idle")) : undefined;
-			const item: SessionItem = { file: s.file, id: s.id, title: s.title, detail: rel, time: s[sortBy], cwd: s.cwd, state };
+			const state = live ? (live.launching ? "launching" : (live.state ?? "unknown")) : undefined;
+			const detail = folder && !rel ? folder.name : path.basename(s.cwd || "");
+			const item: SessionItem = {
+				file: live?.file ?? s.file,
+				id: s.id,
+				title: s.title || path.basename(s.file),
+				detail,
+				time: s[sortBy],
+				cwd: s.cwd || "",
+				state,
+				pinned,
+				missing: !!s.missing,
+				unreadCompletion: live ? !!live.unreadCompletion : this.attention.isUnread(s.file),
+				ownerId: live?.ownerId,
+				terminalKey: live?.terminalKey,
+				kind: live?.kind,
+			};
+			item.current = !!selected && identity === selectedFile && live?.kind === "local" && live.terminalKey === selected[1].terminalKey;
 			if (groupBy === "folder") item.folder = folderLabel(folder, rel, folders.length);
 			items.push(item);
 		}
 		void this.view.webview.postMessage({ type: "sessions", items, groupBy });
 	}
 
-	private open(file: string): void {
-		const info = this.index.find(file);
-		void this.tracker.open({ sessionFile: file, cwd: info?.cwd });
+	private open(file: string, target: OpenMessage = {}): void {
+		if (target.sessionMissing) {
+			void vscode.window.showWarningMessage("Файл закреплённой сессии недоступен. Закрепление можно снять через Unpin Session.");
+			return;
+		}
+		const info = this.index.find(file) ?? this.pins.list().find((pin) => pin.file === file);
+		void this.tracker
+			.open({
+				sessionFile: file,
+				cwd: info?.cwd,
+				ownerId: typeof target.ownerId === "string" ? target.ownerId : undefined,
+				terminalKey: typeof target.terminalKey === "string" ? target.terminalKey : undefined,
+			})
+			.catch((error: Error) => void vscode.window.showWarningMessage(error.message || String(error)));
 	}
 
 	dispose(): void {
