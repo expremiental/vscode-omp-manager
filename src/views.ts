@@ -8,7 +8,7 @@ import type { SessionPins } from "./pins";
 import { type AgentKind, type SessionCatalog, type SessionInfo, parseAnySession } from "./sessions";
 import { type SessionState, type TerminalTracker, agentOf } from "./tracker";
 import { refreshMinutes, showPace, type UsageService, visibleProviders, warnPercent } from "./usage";
-import type { SessionKind, SessionTarget, WindowSessions } from "./windows";
+import type { SessionKind, SessionTarget, VisibleSession, WindowSessions } from "./windows";
 import { worktreeFolders } from "./worktrees";
 
 // One webview holds both sections. Separate VS Code views split the sidebar height
@@ -138,6 +138,8 @@ const vscode = acquireVsCodeApi();
 const CHEVRON = ${JSON.stringify(CHEVRON_SVG)}, PLUS = ${JSON.stringify(PLUS_SVG.replace('width="16" height="16"', 'width="14" height="14"'))};
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function ago(ms) {
+	// Unknown time (a live session whose transcript is not written yet): show nothing, not 1970.
+	if (!ms) return "";
 	const s = Math.max(0, (Date.now() - ms) / 1000);
 	if (s < 60) return "now";
 	if (s < 3600) return Math.floor(s / 60) + "m";
@@ -479,6 +481,23 @@ export function workspaceSessions(index: SessionCatalog): SessionInfo[] {
 	return sessions;
 }
 
+/**
+ * A live session whose transcript cannot be read yet (Claude writes it on the first message,
+ * omp a moment after start) or whose owner window runs a build that only knows its file name.
+ */
+function unindexedLive(live: VisibleSession): Candidate {
+	const id = path.basename(live.file, ".jsonl");
+	let time = live.adoptedAt ?? Date.now();
+	try {
+		time = fs.statSync(live.file).mtimeMs;
+	} catch {
+		// not written yet
+	}
+	// An owner that could not parse the transcript publishes its file name as the title.
+	const title = live.title && live.title !== id ? live.title : "(new session)";
+	return { file: live.file, id: live.id, title, cwd: live.cwd || "", created: time, modified: time };
+}
+
 export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
 	private view: vscode.WebviewView | undefined;
 	private sessionsDirty = true;
@@ -603,7 +622,7 @@ export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Dispo
 		for (const [file, live] of open) {
 			if (!candidates.has(file)) {
 				const indexed = this.index.find(live.file);
-				candidates.set(file, indexed ?? { file: live.file, id: live.id, title: live.title || path.basename(live.file), cwd: live.cwd || "", created: 0, modified: 0 });
+				candidates.set(file, indexed ?? unindexedLive(live));
 			}
 		}
 		for (const pin of this.pins.list()) {
