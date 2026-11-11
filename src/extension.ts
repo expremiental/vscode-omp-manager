@@ -10,7 +10,7 @@ import { systemNotify } from "./systemNotify";
 import { type LaunchOptions, type StateChange, TerminalTracker } from "./tracker";
 import { UsageService } from "./usage";
 import { UsageMonitor } from "./usageMonitor";
-import { OmpViewProvider, workspaceSessions } from "./views";
+import { OmpViewProvider, usageShown, workspaceSessions } from "./views";
 import { type SessionTarget, WindowSessions } from "./windows";
 
 /** What `data-vscode-context` on a session row passes to its context menu commands. */
@@ -192,7 +192,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand("omp.refresh", () => {
 			pins.refresh();
 			view.refreshSessions(true);
-			return usage.refresh();
+			if (usageShown()) return usage.refresh();
 		}),
 		vscode.commands.registerCommand("omp.resumeSession", async () => {
 			const sortByCreated = vscode.workspace.getConfiguration("omp").get<string>("sessions.sortBy") === "created";

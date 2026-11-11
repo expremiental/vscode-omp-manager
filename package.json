@@ -2,7 +2,7 @@
   "name": "omp-manager",
   "displayName": "OMP Session Manager",
   "description": "Oh My Pi sidebar: usage limits, session history, one-click resume, and terminal restore across VS Code restarts.",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "publisher": "mystravil",
   "license": "MIT",
   "repository": {
@@ -382,6 +382,11 @@
         "title": "Usage",
         "order": 2,
         "properties": {
+          "omp.usage.show": {
+            "type": "boolean",
+            "default": true,
+            "description": "Show the Account & Usage section in the sidebar. Off: hidden, and the sidebar stops running `omp usage` (the status bar item and limit notifications keep their own settings)."
+          },
           "omp.usage.refreshMinutes": {
             "type": "number",
             "default": 5,

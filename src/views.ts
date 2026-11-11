@@ -26,6 +26,7 @@ button { font: inherit; color: inherit; background: none; border: 0; cursor: poi
 section { display: flex; flex-direction: column; min-height: 0; }
 section + section { border-top: 1px solid var(--vscode-sideBarSectionHeader-border, var(--vscode-panel-border, transparent)); }
 #usage { flex: none; }
+#usage[hidden] { display: none; }
 #sessions { flex: 1 1 auto; }
 section.collapsed { flex: none; }
 section.collapsed .body { display: none; }
@@ -120,7 +121,7 @@ const PLUS_SVG = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentC
 const SEARCH_SVG = `<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" class="muted"><path d="M15.25 14.19l-4.07-4.07a5.5 5.5 0 1 0-1.06 1.06l4.07 4.07 1.06-1.06zM6.5 11a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>`;
 
 const BODY = `
-<section id="usage">
+<section id="usage" hidden>
 	<button class="head" data-section="usage" aria-expanded="true">${CHEVRON_SVG}<span>Account &amp; Usage</span></button>
 	<div class="body" id="usage-body"></div>
 </section>
@@ -413,7 +414,11 @@ list.addEventListener("scroll", () => {
 });
 
 window.addEventListener("message", e => {
-	if (e.data.type === "usage") { ({ snapshot: usage, warnPercent, resetDisplay, showPace } = e.data); renderUsage(); }
+	if (e.data.type === "usage") {
+		({ snapshot: usage, warnPercent, resetDisplay, showPace } = e.data);
+		document.getElementById("usage").hidden = !e.data.show;
+		renderUsage();
+	}
 	else if (e.data.type === "sessions") { ({ items, groupBy } = e.data); renderSessions(); }
 });
 setInterval(() => { renderUsage(); renderSessions(); }, 60000);
@@ -498,6 +503,11 @@ function unindexedLive(live: VisibleSession): Candidate {
 	return { file: live.file, id: live.id, title, cwd: live.cwd || "", created: time, modified: time };
 }
 
+/** `omp.usage.show`: the Account & Usage section, and the polling behind it. */
+export function usageShown(): boolean {
+	return vscode.workspace.getConfiguration("omp").get<boolean>("usage.show", true);
+}
+
 export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
 	private view: vscode.WebviewView | undefined;
 	private sessionsDirty = true;
@@ -532,7 +542,7 @@ export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Dispo
 			tracker.onDidChange(() => this.refreshSessions()),
 			vscode.workspace.onDidChangeWorkspaceFolders(() => this.refreshSessions()),
 			vscode.workspace.onDidChangeConfiguration((e) => {
-				if (e.affectsConfiguration("omp.usage.refreshMinutes")) this.scheduleUsage();
+				if (e.affectsConfiguration("omp.usage.refreshMinutes") || e.affectsConfiguration("omp.usage.show")) this.scheduleUsage();
 				if (e.affectsConfiguration("omp.usage")) this.postUsage();
 				if (e.affectsConfiguration("omp.sessions")) this.refreshSessions();
 			}),
@@ -569,7 +579,8 @@ export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Dispo
 	private scheduleUsage(): void {
 		clearInterval(this.usageTimer);
 		this.usageTimer = undefined;
-		if (!this.view?.visible) return;
+		// A hidden section never runs `omp usage`.
+		if (!this.view?.visible || !usageShown()) return;
 		const minutes = refreshMinutes();
 		const age = Date.now() - (this.usage.current?.fetchedAt ?? 0);
 		if (age > 60_000) void this.usage.refresh();
@@ -581,6 +592,7 @@ export class OmpViewProvider implements vscode.WebviewViewProvider, vscode.Dispo
 		const snapshot = this.usage.current;
 		void this.view.webview.postMessage({
 			type: "usage",
+			show: usageShown(),
 			snapshot: snapshot && { ...snapshot, providers: visibleProviders(snapshot.providers) },
 			warnPercent: warnPercent(),
 			resetDisplay: vscode.workspace.getConfiguration("omp").get<string>("usage.resetDisplay", "both"),
