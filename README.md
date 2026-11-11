@@ -107,6 +107,42 @@ npm test        # unit tests with a vscode stub
 3. Run `git push --follow-tags`. The Release workflow tests, packages, and publishes a GitHub release with the `.vsix` and the changelog section as notes.
 4. Download the `.vsix` from the release. On the publisher page, <https://marketplace.visualstudio.com/manage/publishers/MYSTRAVIL>, open the extension's **...** menu, choose **Update**, and upload it.
 
+## Local fork: Agent Manager VSCode
+
+This checkout is the local project at `agent-manager-vscode`, based on
+[`expremiental/vscode-omp-manager`](https://github.com/expremiental/vscode-omp-manager)
+commit `4eda213cbcfc9d786bc9d57a31e4afa8ddc2c446` (upstream 0.3.0).
+It preserves the locally customized installed `mystravil.omp-manager-0.3.0`
+extension without changing that installation or VS Code settings.
+
+Local features include persistent pins, shared live sessions and exact-owner
+switching across VS Code windows, unread-completion tracking, status backgrounds,
+current-terminal selection, and the Recent section. Subagent transcripts remain
+hidden and are not indexed; agent execution and transcript files are unaffected.
+Ownership and launch reservations deliberately fail closed when another window's
+ownership or launch outcome cannot be established.
+
+The installed package did not contain the original customized TypeScript sources.
+Its six customized runtime modules (`extension`, `tracker`, `views`, `attention`,
+`windows`, and `pins`) are therefore maintained as JavaScript in `src/`, with only
+obsolete source-map references removed. The other modules retain upstream
+TypeScript; `sessions.ts` also carries the local watcher invalidation events.
+The existing compiler builds both into generated, git-ignored `out/`.
+Do not edit `out/` directly.
+
+`npm test` compiles the extension, runs the upstream TypeScript tests, and runs
+the preserved `test/identity-cache.test.cjs` against the generated runtime.
+These isolated tests do not replace verification in a real VS Code Extension Host.
+Historical local verification notes in the changelog describe earlier work, not
+verification of this migration.
+
+The original non-git project snapshot remains in the sibling directory
+`agent-manager-vscode.snapshot-20261111-222007-89358/`. Its README records the
+pre-migration state; claims there about missing build files no longer describe
+this checkout. Cloning and source recovery do not install, activate, publish, or
+reload the extension. Releases and changes to the installed extension remain
+separate actions.
+
 ## License
 
 [MIT](LICENSE)

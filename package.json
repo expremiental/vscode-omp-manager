@@ -80,6 +80,16 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "omp.session.pin",
+        "title": "Pin Session",
+        "category": "OMP"
+      },
+      {
+        "command": "omp.session.unpin",
+        "title": "Unpin Session",
+        "category": "OMP"
+      },
+      {
         "command": "omp.session.openInEditor",
         "title": "Open in Editor",
         "category": "OMP"
@@ -153,6 +163,16 @@
       ],
       "webview/context": [
         {
+          "command": "omp.session.pin",
+          "when": "webviewId == 'omp.main' && webviewSection == 'session' && !sessionPinned",
+          "group": "1_open@3"
+        },
+        {
+          "command": "omp.session.unpin",
+          "when": "webviewId == 'omp.main' && webviewSection == 'session' && sessionPinned",
+          "group": "1_open@3"
+        },
+        {
           "command": "omp.session.openInEditor",
           "when": "webviewId == 'omp.main' && webviewSection == 'session'",
           "group": "1_open@1"
@@ -184,6 +204,14 @@
         }
       ],
       "commandPalette": [
+        {
+          "command": "omp.session.pin",
+          "when": "false"
+        },
+        {
+          "command": "omp.session.unpin",
+          "when": "false"
+        },
         {
           "command": "omp.newSessionFromEditorTitle",
           "when": "false"
@@ -466,7 +494,7 @@
   "scripts": {
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
-    "test": "tsc -p tsconfig.test.json && node --test --require ./out-test/test/setup.js \"out-test/test/*.test.js\"",
+    "test": "npm run compile && tsc -p tsconfig.test.json && node --test --require ./out-test/test/setup.js \"out-test/test/*.test.js\" && node --test test/identity-cache.test.cjs",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {

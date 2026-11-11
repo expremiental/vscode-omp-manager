@@ -119,6 +119,8 @@ export class SessionIndex implements vscode.Disposable {
 	private debounce: NodeJS.Timeout | undefined;
 	private readonly changed = new vscode.EventEmitter<void>();
 	readonly onDidChange = this.changed.event;
+	private readonly filesChanged = new vscode.EventEmitter<string | undefined>();
+	readonly onDidChangeFiles = this.filesChanged.event;
 
 	constructor(opts: SessionIndexOptions = {}) {
 		this.root = opts.root ?? sessionsDir();
@@ -128,26 +130,34 @@ export class SessionIndex implements vscode.Disposable {
 
 	private watch(): void {
 		try {
-			this.watcher = fs.watch(this.root, { recursive: true }, (_event, name) => this.onFsEvent(name));
+			this.watcher = fs.watch(this.root, { recursive: true }, (event, name) => this.onFsEvent(name, event));
 			this.watcher.on("error", () => {
 				this.watcher?.close();
 				this.watcher = undefined;
+				this.filesChanged.fire(undefined);
 			});
 		} catch {
 			// No sessions dir yet; a later rescan starts the watcher once it exists.
+			this.filesChanged.fire(undefined);
 		}
 	}
 
-	private onFsEvent(name: string | Buffer | null): void {
-		if (name === null) {
+	private onFsEvent(name: string | Buffer | null, event: string): void {
+		let changedFile: string | undefined;
+		if (name == null) {
 			this.rescan = true;
 		} else {
 			const parts = String(name).split(/[\\/]/);
 			// A bucket directory itself changed (created, renamed, deleted): its files may go unreported.
 			if (parts.length === 1) this.rescan = true;
-			else if (parts.length === 2 && parts[1].endsWith(".jsonl")) this.pending.add(path.join(this.root, ...parts));
+			else if (parts.length === 2 && parts[1].endsWith(".jsonl")) {
+				const file = path.join(this.root, ...parts);
+				this.pending.add(file);
+				if (event === "change") changedFile = file;
+			}
 			else return;
 		}
+		this.filesChanged.fire(changedFile);
 		clearTimeout(this.debounce);
 		this.debounce = setTimeout(() => void this.run(() => this.flush()), this.debounceMs);
 	}
@@ -279,5 +289,6 @@ export class SessionIndex implements vscode.Disposable {
 		clearTimeout(this.debounce);
 		this.watcher?.close();
 		this.changed.dispose();
+		this.filesChanged.dispose();
 	}
 }

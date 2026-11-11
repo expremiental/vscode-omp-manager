@@ -6,6 +6,7 @@
     "outDir": "out",
     "rootDir": "src",
     "strict": true,
+    "allowJs": true,
     "sourceMap": true,
     "skipLibCheck": true
   },
